@@ -1,0 +1,168 @@
+/***********************************************************************************
+ ************************* Product Categories - Query Loop *************************
+ ****************** by Henrik B. Hansen 2024 - do not delete!! *********************
+ *************************** Status - Under Construction ***************************
+ **********************************************************************************/
+
+// 1. Register Product Categories as a Custom Post Type for Query Block
+function register_product_cat_as_post_type() {
+    // Get the custom product category base slug from WooCommerce settings
+    $product_cat_base = get_option( 'woocommerce_product_cat_base', 'product-category' );
+
+    // Register product categories as a custom post type for the query block
+    register_post_type( 'product_cat', array(
+        'label'             => __( 'Product Categories', 'woocommerce' ),
+        'public'            => true,
+        'show_in_rest'      => true,
+        'rest_base'         => 'product_cat',
+        'show_in_graphql'   => true,
+        'supports'          => array( 'title', 'thumbnail' ),
+        'has_archive'       => false,
+        'show_ui'           => true,
+        'hierarchical'      => true,
+        'rewrite'           => array( 'slug' => $product_cat_base ), // Dynamically set the slug based on WooCommerce permalink settings
+    ) );
+}
+add_action( 'init', 'register_product_cat_as_post_type' );
+
+
+// 2. Add Product Categories to the Query Block filters
+function add_product_categories_to_query_block( $settings ) {
+    if ( isset( $settings['core/query'] ) ) {
+        // Add product categories as a filterable taxonomy in the query block
+        $settings['core/query']['supports']['filters'] = array(
+            'taxonomy' => array(
+                'product_cat'  => __( 'Product Categories', 'woocommerce' ),
+            ),
+        );
+    }
+    return $settings;
+}
+add_filter( 'block_editor_settings_all', 'add_product_categories_to_query_block' );
+
+// 3. Modify the Parent Category Filter to Autofill Product Categories
+function autofill_parent_category_filter( $filters, $block_instance ) {
+    if ( isset( $filters['product_cat'] ) ) {
+        // Check WooCommerce setting to hide empty categories (based on stock setting)
+        $hide_empty = get_option( 'woocommerce_hide_out_of_stock_items', 'no' ) === 'yes';
+
+        // Check if the "Category Order and Taxonomy Terms Order" plugin is active
+        $is_category_order_plugin_active = is_plugin_active( 'taxonomy-terms-order/taxonomy-terms-order.php' );
+
+        // Get the top-level categories with manual order or by name, and hide empty categories
+        if ( $is_category_order_plugin_active ) {
+            // If plugin is active, order by term_order (Category Order and Taxonomy Terms Order plugin)
+            $categories = get_terms( array(
+                'taxonomy'   => 'product_cat',
+                'parent'     => 0, // Only top-level categories
+                'orderby'    => 'term_order', // Use term_order set by Taxonomy Terms Order plugin
+                'order'      => 'ASC', // Ascending order
+                'hide_empty' => $hide_empty, // Dynamically set based on WooCommerce setting
+            ) );
+        } else {
+            // Fallback to WooCommerce menu_order or name ordering if the plugin is not active
+            $categories = get_terms( array(
+                'taxonomy'   => 'product_cat',
+                'parent'     => 0, // Only top-level categories
+                'orderby'    => 'menu_order', // First, try ordering by menu_order
+                'order'      => 'ASC', // Ascending order
+                'hide_empty' => $hide_empty, // Dynamically set based on WooCommerce setting
+            ) );
+
+            // If no categories are ordered manually, fallback to ordering by name
+            if ( empty( $categories ) || is_wp_error( $categories ) ) {
+                $categories = get_terms( array(
+                    'taxonomy'   => 'product_cat',
+                    'parent'     => 0,
+                    'orderby'    => 'name', // Fallback to ordering by name
+                    'order'      => 'ASC',
+                    'hide_empty' => $hide_empty, // Dynamically set based on WooCommerce setting
+                ) );
+            }
+        }
+
+        // Prepare options if categories were fetched successfully
+        if ( !is_wp_error( $categories ) && !empty( $categories ) ) {
+            $options = array();
+            foreach ( $categories as $category ) {
+                $options[] = array(
+                    'label' => $category->name,  // Display the category name
+                    'value' => $category->term_id,  // Use the category ID for filtering
+                );
+            }
+
+            // Update the filter options in the block instance
+            if ( isset( $filters['product_cat'] ) ) {
+                $filters['product_cat']['options'] = $options;
+            }
+        }
+    }
+
+    return $filters;
+}
+add_filter( 'block_editor_settings_all', 'autofill_parent_category_filter', 10, 2 );
+
+
+// 4. Handle the Query and Output for Product Categories
+function product_category_query_and_output( $query_args, $block_instance ) {
+    // Ensure we're dealing with product categories
+    if ( isset( $block_instance['post_type'] ) && $block_instance['post_type'] === 'product_cat' ) {
+        // Get filters if available
+        $filters = isset( $block_instance['filters'] ) ? $block_instance['filters'] : [];
+
+        // Set default hide_empty to match WooCommerce's setting for out-of-stock items
+        $hide_empty = get_option( 'woocommerce_hide_out_of_stock_items', 'no' ) === 'yes';
+
+        // Set the default query args for product categories
+        $query_args['taxonomy'] = 'product_cat';  // Query for product categories
+        $query_args['orderby']  = 'menu_order'; // Try ordering by manual (menu_order)
+        $query_args['order']    = 'ASC';  // Ascending order
+        $query_args['hide_empty'] = $hide_empty;  // Hide empty categories (optional)
+
+        // Fallback: if manual ordering is not set, use alphabetical order
+        if ( empty( $query_args['orderby'] ) || !in_array( $query_args['orderby'], ['name', 'menu_order'] ) ) {
+            $query_args['orderby'] = 'name';
+        }
+
+        // Handle parent category filter (if set)
+        if ( !empty( $filters['product_cat'] ) ) {
+            $parent_category = (int) $filters['product_cat'];
+            $query_args['tax_query'] = array(
+                array(
+                    'taxonomy' => 'product_cat',
+                    'field'    => 'id',
+                    'terms'    => $parent_category,
+                    'operator' => 'IN',
+                ),
+            );
+        }
+
+        // Set the number of categories to show
+        $query_args['posts_per_page'] = isset($block_instance['number']) ? $block_instance['number'] : -1; // Show all by default
+    }
+
+    // Query for categories (after applying the filter args)
+    $categories = get_terms( $query_args );
+
+    // Output the categories if available
+    if ( !is_wp_error( $categories ) && !empty( $categories ) ) {
+        echo '<div class="product-categories-loop">';
+        foreach ( $categories as $category ) {
+            ?>
+            <div class="product-category">
+                <a href="<?php echo esc_url( get_term_link( $category ) ); ?>">
+                    <?php echo get_the_post_thumbnail( $category->term_id, 'medium' ); ?>
+                    <h2><?php echo esc_html( $category->name ); ?></h2>
+                </a>
+            </div>
+            <?php
+        }
+        echo '</div>';
+    } else {
+        echo '<p>' . __( 'No categories found.', 'woocommerce' ) . '</p>';
+    }
+
+    // Return modified query args for further processing if needed
+    return $query_args;
+}
+add_filter( 'block_query_args', 'product_category_query_and_output', 10, 2 );
